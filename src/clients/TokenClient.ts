@@ -1,0 +1,233 @@
+import { utils, BigNumber, ContractTransaction, ContractFactory } from 'ethers';
+import {
+  TxOverrides,
+  ClientType,
+  SignerOrProvider,
+  TokenClientType,
+} from '../types';
+
+import { abis } from '../abis/exports';
+
+import {
+  MetaTxToken__factory as TokenFactory,
+  MetaTxToken,
+  TokenERC20__factory as TokenERC20Factory,
+  TokenERC20,
+  TokenSAI__factory as TokenSAIFactory,
+  TokenSAI,
+} from '../contracts';
+
+const { getAddress, isHexString, parseBytes32String } = utils;
+
+const { abi: tokenAuthorityAbi, bytecode: tokenAuthorityBytecode } =
+  abis.TokenAuthority;
+
+// Token addresses to identify tokens that need special treatment
+const tokenAddresses = {
+  SAI: '0x89d24A6b4CcB1B6fAA2625fE562bDD9a23260359',
+};
+
+const isSai = (address: string): boolean =>
+  getAddress(address) === tokenAddresses.SAI;
+
+/** Standard information about an ERC20 token */
+export interface TokenInfo {
+  name: string;
+  symbol: string;
+  decimals: number;
+}
+
+/** A ColonyToken has special abilities that go beyond the capabilities of an ERC20 token */
+export interface ColonyTokenClient extends MetaTxToken {
+  clientType: ClientType.TokenClient;
+  tokenClientType: TokenClientType.Colony;
+
+  /**
+   * Deploy a TokenAuthority contract for this Colony for a specific token
+   * The TokenAuthority enables certain addresses to transfer the tokens, even if it's locked
+   * It also enables the assigned Colony to mint tokens
+   *
+   * @remarks
+   * Only works with tokens that allow for an authority to be set (e.g. tokens deployed with Colony)
+   *
+   * @param tokenAddress The token to install the token authority for
+   * @param allowedToTransfer Addresses that are allowed to transfer the token, even if it's locked
+   */
+  deployTokenAuthority(
+    colonyAddress: string,
+    allowedToTransfer: string[],
+    overrides?: TxOverrides,
+  ): Promise<ContractTransaction>;
+  /** Get the standard ERC20 token information */
+  getTokenInfo(): Promise<TokenInfo>;
+
+  estimateGas: MetaTxToken['estimateGas'] & {
+    /**
+     * Deploy a TokenAuthority contract for this Colony for a specific token
+     * The TokenAuthority enables certain addresses to transfer the tokens, even if it's locked
+     * It also enables the assigned Colony to mint tokens
+     *
+     * @remarks
+     * Only works with tokens that allow for an authority to be set (e.g. tokens deployed with Colony)
+     *
+     * @param tokenAddress The token to install the token authority for
+     * @param allowedToTransfer Addresses that are allowed to transfer the token, even if it's locked
+     */
+    deployTokenAuthority(
+      colonyAddress: string,
+      allowedToTransfer: string[],
+      overrides?: TxOverrides,
+    ): Promise<BigNumber>;
+  };
+}
+
+/** A standard ERC20 token */
+export interface Erc20TokenClient extends TokenERC20 {
+  clientType: ClientType.TokenClient;
+  tokenClientType: TokenClientType.Erc20;
+
+  /** Get the standard ERC20 token information */
+  getTokenInfo(): Promise<TokenInfo>;
+}
+
+/** The SAI token. It requires special treatment as it's deprecated */
+export interface DaiTokenClient extends TokenSAI {
+  clientType: ClientType.TokenClient;
+  tokenClientType: TokenClientType.Sai;
+
+  /** Get the standard ERC20 token information */
+  getTokenInfo(): Promise<TokenInfo>;
+}
+
+export type TokenClient = ColonyTokenClient | Erc20TokenClient | DaiTokenClient;
+
+async function checkTokenAuthorityCompatibility(
+  tokenClient: ColonyTokenClient,
+): Promise<void> {
+  try {
+    await tokenClient.authority();
+    return;
+  } catch (e) {
+    throw new Error('Token can not be assigned a TokenAuthority');
+  }
+}
+
+async function deployTokenAuthority(
+  this: ColonyTokenClient,
+  colonyAddress: string,
+  allowedToTransfer: string[],
+  overrides: TxOverrides = {},
+): Promise<ContractTransaction> {
+  const tokenAuthorityFactory = new ContractFactory(
+    tokenAuthorityAbi,
+    tokenAuthorityBytecode,
+    this.signer,
+  );
+  const tokenAuthorityContract = await tokenAuthorityFactory.deploy(
+    this.address,
+    colonyAddress,
+    allowedToTransfer,
+    overrides,
+  );
+  await tokenAuthorityContract.deployed();
+  return tokenAuthorityContract.deployTransaction;
+}
+
+async function estimateDeployTokenAuthority(
+  this: ColonyTokenClient,
+  colonyAddress: string,
+  allowedToTransfer: string[],
+  overrides: TxOverrides = {},
+): Promise<BigNumber> {
+  const tokenAuthorityFactory = new ContractFactory(
+    tokenAuthorityAbi,
+    tokenAuthorityBytecode,
+  );
+  const deployTx = tokenAuthorityFactory.getDeployTransaction(
+    this.address,
+    colonyAddress,
+    allowedToTransfer,
+    overrides,
+  );
+  return this.provider.estimateGas(deployTx);
+}
+
+const getTokenClient = async (
+  address: string,
+  signerOrProvider: SignerOrProvider,
+): Promise<TokenClient> => {
+  let tokenClient: TokenClient;
+  let isColonyToken = false;
+
+  tokenClient = TokenFactory.connect(
+    address,
+    signerOrProvider,
+  ) as ColonyTokenClient;
+
+  try {
+    await tokenClient.totalSupply();
+  } catch (err) {
+    throw new Error(
+      `Token is probably not a valid ERC20 token, got ${
+        (err as Error).message
+      }`,
+    );
+  }
+
+  // Colony tokens have the `locked()` and `authority()` methods. We assume that when it exists on
+  // the contract we have a ColonyToken 🦆. This might not be true though, so can't rely
+  // on this 100% when trying to call contract methods
+  try {
+    await tokenClient.locked();
+    await checkTokenAuthorityCompatibility(tokenClient);
+    isColonyToken = true;
+  } catch {
+    isColonyToken = false;
+  }
+
+  if (isColonyToken) {
+    tokenClient.tokenClientType = TokenClientType.Colony;
+
+    tokenClient.deployTokenAuthority = deployTokenAuthority.bind(tokenClient);
+    tokenClient.estimateGas.deployTokenAuthority =
+      estimateDeployTokenAuthority.bind(tokenClient);
+  } else if (isSai(address)) {
+    tokenClient = TokenSAIFactory.connect(
+      address,
+      signerOrProvider,
+    ) as DaiTokenClient;
+
+    tokenClient.tokenClientType = TokenClientType.Sai;
+  } else {
+    tokenClient = TokenERC20Factory.connect(
+      address,
+      signerOrProvider,
+    ) as Erc20TokenClient;
+
+    tokenClient.tokenClientType = TokenClientType.Erc20;
+  }
+
+  tokenClient.clientType = ClientType.TokenClient;
+
+  tokenClient.getTokenInfo = async (): Promise<TokenInfo> => {
+    let name = await tokenClient.name();
+    // Special case for contracts with bytes32 strings (I'm looking at you, DAI)
+    if (isHexString(name)) {
+      name = parseBytes32String(name);
+    }
+    let symbol = await tokenClient.symbol();
+    if (isHexString(symbol)) {
+      symbol = parseBytes32String(symbol);
+    }
+    const decimals = await tokenClient.decimals();
+    return {
+      name,
+      symbol,
+      decimals,
+    };
+  };
+
+  return tokenClient;
+};
+
+export default getTokenClient;
