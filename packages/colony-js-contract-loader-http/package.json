@@ -59,10 +59,10 @@
     "devDependencies": {
         "flow-bin": "^0.98.1",
         "flow-copy-source": "^2.0.6",
-        "jest": "^22.4.0",
+        "jest": "^24.0.0",
         "jest-fetch-mock": "^2.1.2",
         "jest-sandbox": "^1.1.2",
-        "webpack": "^4.31.0",
+        "webpack": "^5.1.1",
         "webpack-cli": "^3.3.2"
     },
     "engines": {
